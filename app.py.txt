@@ -1,0 +1,105 @@
+import os
+import time
+import threading
+import requests
+import json
+from flask import Flask
+from google.oauth2.service_account import Credentials
+import gspread
+from bs4 import BeautifulSoup
+
+app = Flask(__name__)
+
+# ==== 環境変数 ====
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Discord通知用
+SHEET_ID = os.getenv("SHEET_ID")        # スプレッドシートID
+CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")  # 認証情報
+PROXY_URL = os.getenv("PROXY_URL")      # Cloudflare Worker URL
+
+# ==== Google Sheets接続 ====
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+creds = Credentials.from_service_account_info(json.loads(CREDENTIALS_JSON), scopes=scope)
+client = gspread.authorize(creds)
+sheet = client.open_by_key(SHEET_ID).sheet1
+
+last_rows = set()  # 前回確認したURLを保存
+
+
+# ==== メルカリURLからHTMLを取得 ====
+def fetch_page(url):
+    try:
+        res = requests.get(f"{PROXY_URL}?url={url}", timeout=10)
+        res.raise_for_status()
+        return res.text
+    except Exception as e:
+        print(f"⚠️ Fetch error: {e}")
+        return None
+
+
+# ==== 削除・売り切れチェック ====
+def is_item_unavailable(html):
+    if html is None:
+        return False
+    soup = BeautifulSoup(html, "html.parser")
+    # 売り切れ・削除された場合の共通要素を検出
+    if "この商品は削除されたか、または見つかりません" in html:
+        return True
+    if soup.find("div", string=lambda s: s and "SOLD" in s.upper()):
+        return True
+    if soup.find("button", disabled=True):
+        return True
+    return False
+
+
+# ==== スプレッドシート監視 ====
+def check_spreadsheet():
+    global last_rows
+    print("📊 スプレッドシート監視スレッド開始（削除/売り切れ検知）")
+
+    while True:
+        try:
+            rows = sheet.get_all_values()
+            current_urls = set(row[0] for row in rows[1:] if row[0].startswith("http"))
+            
+            # 新しい行のチェック
+            new_urls = current_urls - last_rows
+            for url in new_urls:
+                print(f"🆕 新しいURL検出: {url}")
+            last_rows = current_urls
+
+            # 各URLの削除/売り切れチェック
+            for url in list(current_urls):
+                html = fetch_page(url)
+                if is_item_unavailable(html):
+                    message = f"❌ 商品削除または売り切れ検知:\n{url}"
+                    print(message)
+                    requests.post(WEBHOOK_URL, json={"content": message})
+                    time.sleep(3)
+
+        except Exception as e:
+            print(f"⚠️ エラー発生: {e}")
+
+        time.sleep(60)  # 1分ごとにチェック
+
+
+# ==== 起動時処理 ====
+@app.route('/')
+def home():
+    return "Bot is running and monitoring deleted/sold-out items."
+
+def run_checker():
+    thread = threading.Thread(target=check_spreadsheet, daemon=True)
+    thread.start()
+    print("✅ スプレッドシート監視スレッドを開始しました")
+
+
+if __name__ == '__main__':
+    print("🤖 Bot起動中")
+    # Render起動通知
+    if WEBHOOK_URL:
+        requests.post(WEBHOOK_URL, json={"content": "✅ Render起動通知（削除・売り切れ検知モード）"})
+    else:
+        print("⚠️ 環境変数 WEBHOOK_URL が未設定です")
+
+    run_checker()
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
